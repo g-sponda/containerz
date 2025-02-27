@@ -8,8 +8,10 @@ Vagrant.configure("2") do |config|
 
   config.vm.synced_folder ".", "/home/vagrant/containerz", type: "rsync"
 
-  # Install Zig on VM, the shell script can be found at ./install_zig.sh
+  # Install Zig and lib6-dev on VM, setup a filesystem that will be used by containerz
+  # the shell script can be found at ./utils/vagrant_setup.sh
   config.vm.provision "shell" do |s|
-    s.inline = "sudo snap install zig --beta --classic && sudo apt install libc6-dev -y"
+    # TODO: set the correct permission on gneric_fs dir
+    s.inline = "bash /home/vagrant/containerz/utils/vagrant_setup.sh"
   end
 end

@@ -12,3 +12,6 @@ vagrant-ssh:
 recreate-vagrant-vm: destroy-vagrant-vm
 	@sleep 5			# We set a sleep to make sure that the VM was destroyed, and that there's no config left before recreating
 	$(MAKE) create-vagrant-vm
+
+create-generic-fs:
+	./utils/create_generic_fs.sh
