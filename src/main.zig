@@ -1,9 +1,51 @@
 const c = @cImport({
+    @cInclude("sys/wait.h");
     @cInclude("unistd.h");
 });
 const std = @import("std");
 const linux = std.os.linux;
+const posix = std.posix;
 const dir = std.fs.cwd();
+const cgroups = @import("cgroups.zig");
+const helpers = @import("helpers.zig");
+
+const STACK_SIZE = 1024 * 1024;
+
+fn child(arg: usize) callconv(.C) u8 {
+    // Convert `arg` back into a proper pointer to the argument slice
+    const args_ptr: *[][]u8 = @ptrFromInt(arg);
+    const args: [][]u8 = args_ptr.*;
+
+    std.debug.print("Child execution.\n\tRunning command: {s} args: {s}\n", .{ args[0], args[1..] });
+
+    defer helpers.cleanup();
+    // std.debug.print("Configuring Cgroups\n", .{});
+    // cgroups.setup_cgroups_v2() catch |err| {
+    //     std.log.err("Error setting up cgroups: {}\n", .{err});
+    //     return 1;
+    // };
+
+    std.debug.print("Configuring hostname\n", .{});
+    set_hostname() catch |err| {
+        std.log.err("Error setting hostname: {}\n", .{err});
+        return 1;
+    };
+
+    std.debug.print("Configuring fylesystem\n", .{});
+    set_container_fs() catch |err| {
+        std.log.err("Error setting container filesystem: {}\n", .{err});
+        return 1;
+    };
+
+    std.debug.print("executing command!!!\n", .{});
+    helpers.exec_cmd(args) catch |err| {
+        std.log.err("Error executing command: {}\n", .{err});
+        return 1;
+    };
+
+    std.debug.print("Exiting child process, bye\n", .{});
+    return 0;
+}
 
 pub fn main() !void {
     // Get allocator
@@ -27,8 +69,6 @@ pub fn main() !void {
         'r' => try run(
             args[2..],
         ),
-        'c' => try child(args[2..]),
-
         else => std.debug.print("Unkown command: {s}\n", .{cmd}),
     }
 }
@@ -44,57 +84,54 @@ pub fn main() !void {
 // Create a container and run <cmd> inside it.
 fn run(args: [][]u8) !void {
     std.debug.print("Run execution.\n\tRunning command: {s} args: {s}\n", .{ args[0], args[1..] });
-    // Get allocator
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // call deinit to free if necessary
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator(); // use allocator
 
-    const child_args = try build_child_args(args);
-    std.debug.print("Child args: {s}\n", .{child_args});
-    var proc = std.process.Child.init(child_args, allocator);
-    proc.stdin = std.io.getStdIn();
-    proc.stdout = std.io.getStdOut();
-    proc.stderr = std.io.getStdErr();
+    const flags = linux.CLONE.NEWUTS | linux.CLONE.NEWPID | linux.CLONE.NEWNS | linux.CLONE.NEWUSER;
 
-    try isolate();
+    // Initialize the PID and ptid for the clone call.
+    var child_pid: i32 = 0;
+    var ptid: i32 = undefined;
+
+    // Allocate the child stack and ensure it's correctly initialized.
+    const child_stack: [STACK_SIZE]u8 align(16) = undefined;
+
+    // Call clone to create the child process
+    const pid = linux.clone(&child, @intFromPtr(&child_stack[0]) + child_stack.len, flags, @intFromPtr(&args), &ptid, 0, &child_pid);
+
+    // Check if the clone was successful
+    if (pid < 0) {
+        std.debug.print("Error: clone failed with errno: {}\n", .{posix.errno(pid)});
+        return;
+    }
+
+    std.debug.print("Clone successful, PID: {}\n", .{pid});
+
+    const unshare_result = linux.unshare(flags); // Need to check if this unshare will be needed, after fixing parent process to close when child exit bash
+    switch (posix.errno(unshare_result)) {
+        .SUCCESS => std.debug.print("Unshare successful\n", .{}),
+        .PERM => std.debug.print("Error: Operation not permitted\n", .{}),
+        .INVAL => std.debug.print("Error: Invalid argument\n", .{}),
+        .NOMEM => std.debug.print("Error: Insufficient kernel memory\n", .{}),
+        else => |err| std.debug.print("Unexpected error: {}\n", .{err}),
+    }
+
+    // Now that the child is cloned, we can configure user namespaces if necessary
     try setup_user_ns();
 
-    try proc.spawn(); // start child process and wait
-    _ = try proc.wait();
-}
+    // Parent waits for the child process to exit
+    var status: i32 = 0;
 
-fn build_child_args(args: [][]u8) ![][]u8 {
-    const arrayllocator = std.heap.page_allocator;
-    var child_args = std.ArrayList([]u8).init(arrayllocator);
-    defer child_args.deinit();
-
-    try child_args.append(@constCast("/proc/self/exe"));
-    try child_args.append(@constCast("child"));
-    for (args) |arg| {
-        try (child_args.append(arg));
+    // Wait for the child to exit, without WNOHANG flag (we want to block until it exits)
+    const ret = c.waitpid(@intCast(pid), &status, 0); // TODO: fix `Error: waitpid failed, errno: os.linux.E__enum_4178.CHILD`
+    if (ret < 0) {
+        std.debug.print("Error: waitpid failed, errno: {}\n", .{posix.errno(ret)});
+        return;
     }
-    return try child_args.toOwnedSlice();
-}
 
-// Setup the container and run the command specified as argument
-fn child(args: [][]u8) !void {
-    std.debug.print("Child execution.\n\tRunning command: {s} args: {s}\n", .{ args[0], args[1..] });
+    // Print the exit status of the child
+    std.debug.print("Child process exited with status: {}\n", .{status});
 
-    defer cleanup();
-
-    try set_hostname();
-    try setup_fs();
-    try setup_cgroups_v2();
-    try exec_cmd(args);
-}
-
-// Isolate namespaces
-fn isolate() !void {
-    // We use pipes here to combine multiple bitmask flags into one integer,
-    // so all these namespaces are isolated together.
-    const flags = linux.CLONE.NEWUSER | linux.CLONE.NEWPID | linux.CLONE.NEWUTS | linux.CLONE.NEWNS;
-    _ = linux.unshare(flags);
+    // Optionally, exit the parent process after the child has exited.
+    // std.process.exit(0); // Uncomment if you want to exit the parent after the child.
 }
 
 fn set_hostname() !void {
@@ -113,8 +150,8 @@ fn set_hostname() !void {
     }
 }
 
-fn setup_fs() !void {
-    // Change the root fylesystem to the one created beforehand at the defined value on the chroot bellow
+fn set_container_fs() !void {
+    // // Change the root fylesystem to the one created beforehand at the defined value on the chroot bellow
     _ = linux.chroot("/home/containerz/genericfs");
     _ = linux.chdir("/");
 
@@ -130,87 +167,4 @@ fn setup_user_ns() !void {
     try dir.writeFile(.{ .sub_path = "/proc/self/setgroups", .data = "deny" });
     try dir.writeFile(.{ .sub_path = "/proc/self/uid_map", .data = "0 1000 1" });
     try dir.writeFile(.{ .sub_path = "/proc/self/gid_map", .data = "0 1000 1" });
-}
-
-fn is_cgroups_v2() bool {
-    const path_cgroup_file_cgroup_v2 = "/sys/fs/cgroup/cgroup.controllers";
-
-    // check if the call didn't returned error, so it was a success and the file exists,
-    // this file is a file that exists on cgroup v2, so if it exists we now the cgroup is the v2,
-    // otherwise if we get an error it might be v1
-    dir.access(path_cgroup_file_cgroup_v2, .{}) catch return false;
-
-    return true;
-}
-
-fn setup_cgroups() !void {
-    if (is_cgroups_v2()) {
-        std.debug.print("cgroups V2", .{});
-        try setup_cgroups_v2();
-    } else {
-        std.debug.print("cgroups V1", .{});
-        try setup_cgroups_v1();
-    }
-}
-
-// Configure Cgroups to limit resources, and protect the container from
-// for example a fork bomb
-fn setup_cgroups_v1() !void {
-    const cgroup_path = "/sys/fs/cgroup/pids/containerz";
-
-    // Create Cgroup
-    try dir.makePath(cgroup_path);
-
-    // limit the number of processes to 20
-    try dir.writeFile(.{ .sub_path = cgroup_path ++ "/pids.max", .data = "50" });
-
-    // automatically remove the cgroup when empty
-    try dir.writeFile(.{ .sub_path = cgroup_path ++ "/notify_on_release", .data = "1" });
-
-    // add the current process to the cgroup
-    var pid_buf: [10]u8 = undefined;
-    const pid_str = try std.fmt.bufPrint(&pid_buf, "{}", .{linux.getpid()});
-
-    try dir.writeFile(.{ .sub_path = cgroup_path ++ "/cgroup.procs", .data = pid_str });
-}
-
-fn setup_cgroups_v2() !void {
-    const cgroup_path = "/sys/fs/cgroup/containerz";
-
-    // Create the cgroup directory
-    try dir.makePath(cgroup_path);
-    //TODO: fix: `thread 1 panic: reached unreachable code`
-    var cgroup_dir = try dir.openDir(cgroup_path, .{ .iterate = true });
-    defer cgroup_dir.close();
-
-    // Change ownership to allow non-root access (optional, but safer)
-    const uid = 1000; // Change to your user ID
-    const gid = 1000; // Change to your group ID
-    try cgroup_dir.chown(uid, gid);
-    std.debug.print("Chown gaven", .{});
-
-    // Enable the "pids" controller
-    try dir.writeFile(.{ .sub_path = cgroup_path ++ "/cgroup.subtree_control", .data = "+pids" });
-
-    // Limit process count
-    try dir.writeFile(.{ .sub_path = cgroup_path ++ "/pids.max", .data = "50" });
-
-    // Add current process
-    var pid_buf: [10]u8 = undefined;
-    const pid_str = try std.fmt.bufPrint(&pid_buf, "{}", .{linux.getpid()});
-    try dir.writeFile(.{ .sub_path = cgroup_path ++ "/cgroup.procs", .data = pid_str });
-}
-
-fn exec_cmd(args: [][]u8) !void {
-    // Get allocator
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // call deinit to free if necessary
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator(); // use allocator
-
-    std.process.execv(allocator, args) catch unreachable;
-}
-
-fn cleanup() void {
-    _ = linux.umount("proc");
 }
